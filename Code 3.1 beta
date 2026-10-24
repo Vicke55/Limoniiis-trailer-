@@ -1,0 +1,1943 @@
+// ==UserScript==
+// @name         GeoFS A350 Startup v3.1.0
+// @namespace    Vicke55
+// @version      3.1.0
+// @description  Airbus A350 Startup Panel for GeoFS
+// @match        https://*.geo-fs.com/geofs.php*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ============================================================
+    // ASSETS AND SETTINGS
+    // ============================================================
+
+    const BASE = 'https://raw.githubusercontent.com/Vicke55/Airbus-startup-test/main/';
+    const IMAGE_BASE = BASE + 'minmapp/';
+    const ENG_BASE = BASE + 'ENG%20start-images/';
+    const SOUND_BASE = BASE + 'suonds/';
+
+    const SOUND_URLS = {
+        click: SOUND_BASE + 'cockpit-click.mp3',
+        fanStart: SOUND_BASE + 'Fan-start.mp3',
+        fanRunning: SOUND_BASE + 'Fan-running.mp3',
+        cabin: SOUND_BASE + 'Airbus%20waikky.mp3',
+        seatbelts: SOUND_BASE + 'Seatbelts.mp3'
+    };
+
+    const CROP_TOP = 950;
+    const ENG_CROP_TOP = 1530;
+    const EXT_DELAY = 3000;
+    const APU_READY_DELAY = 8000;
+    const EXT_APU_START_DELAY = 8000;
+    const FAN_START_DELAY_APU = 0;
+    const FAN_START_DELAY_EXT = 4500;
+    const FAN_NORMAL_VOLUME = 1;
+    const FAN_LOW_VOLUME = 0.25;
+    const FAN_FADE_DURATION = 3000;
+    // GeoFS can report an engine as running before the startup animation has finished.
+    // Require a minimum start interval as well as a stable running status.
+    const ENGINE_START_FALLBACK = 30000;
+    const ENGINE_MIN_START_DURATION = 12000;
+    const ENGINE_POLL_INTERVAL = 250;
+    const ENGINE_STABLE_DURATION = 3000;
+    const ENGINE_STOP_STABLE_DURATION = 2000;
+    const POST_FLIGHT_APU_DELAY = 8000;
+
+    const COMMON_IMAGES = [26, 27, 28, 29, 30, 31, 32, 33, 34, 35];
+    const FLIGHT_IMAGES = [36, 35];
+    const POST_FLIGHT_IMAGES = [37, 38, 39, 40, 41, 42, 43, 44, 45, 25];
+
+    const APU_SEQUENCE = [
+        1, 2, 3, 8, 9, 10, 11,
+        12, 13, 14, 15, 16, 17, 18, 19,
+        20, 21, 22, 23, 24, 25,
+        ...COMMON_IMAGES,
+        ...FLIGHT_IMAGES,
+        ...POST_FLIGHT_IMAGES
+    ];
+
+    const EXT_CONTINUATION = [65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75];
+
+    const EXT_BOARDING_SEQUENCE = [
+        76, 77, 78, 79, 80, 81, 82, 83, 84, 25,
+        ...COMMON_IMAGES,
+        ...FLIGHT_IMAGES,
+        ...POST_FLIGHT_IMAGES
+    ];
+
+    const EXT_SEQUENCE_CONNECTED_LATER = [
+        1, 2, 3, 4, 5, 6,
+        ...EXT_CONTINUATION,
+        ...EXT_BOARDING_SEQUENCE
+    ];
+
+    const EXT_SEQUENCE_CONNECTED_INITIALLY = [
+        1, 7, 4, 5, 6,
+        ...EXT_CONTINUATION,
+        ...EXT_BOARDING_SEQUENCE
+    ];
+
+    // ============================================================
+    // STATE
+    // ============================================================
+
+    const state = {
+        open: false,
+        firstOpen: true,
+        startChoice: null,
+        panelPosition: 'center',
+        image: 1,
+        sequenceIndex: 0,
+
+        extConnected: false,
+        extBusy: false,
+        extConnectedDuringSequence: false,
+        extInitiallyConnected: false,
+        extSoundsStarted: false,
+
+        checklistLocked: false,
+        lockedChecklistKey: null,
+
+        apuStarted: false,
+        apuAvailable: false,
+        apuGenSoundsPlayed: false,
+
+        engPanelOpen: false,
+        engImage: 89,
+        eng1Started: false,
+        eng2Started: false,
+        eng1Starting: false,
+        eng2Starting: false,
+        eng1Stopping: false,
+        eng2Stopping: false,
+        engMode: 'NORM',
+        engNormReached: false,
+        engineStartPanelActive: false,
+        engineStartPanelComplete: false,
+        postFlightShutdownActive: false,
+        postFlightShutdownComplete: false,
+
+        soundEnabled: true,
+        currentTab: 'before',
+
+        audioTimers: [],
+        fanVolumeTimer: null,
+        fanSequenceRequested: false,
+        apuTimer: null,
+        apuRunToken: 0,
+        postFlightAPUTimer: null,
+        postFlightAPUToken: 0,
+        extTimerToken: 0,
+        extApuStartTimer: null,
+        extApuStartToken: 0,
+        engineTimers: []
+    };
+
+    let overheadWindow = null;
+
+    // ============================================================
+    // AUDIO
+    // ============================================================
+
+    const audio = {
+        click: new Audio(SOUND_URLS.click),
+        fanStart: new Audio(SOUND_URLS.fanStart),
+        fanRunning: new Audio(SOUND_URLS.fanRunning),
+        cabin: new Audio(SOUND_URLS.cabin),
+        seatbelts: new Audio(SOUND_URLS.seatbelts)
+    };
+
+    audio.click.volume = 0.45;
+    audio.cabin.volume = 0.55;
+    audio.seatbelts.volume = 0.55;
+    audio.fanStart.volume = FAN_NORMAL_VOLUME;
+    audio.fanRunning.volume = FAN_NORMAL_VOLUME;
+    audio.fanRunning.loop = true;
+    audio.fanStart.loop = false;
+
+    function playAudio(name, restart = true) {
+        if (!state.soundEnabled || !audio[name]) return false;
+        const sound = audio[name];
+        try {
+            if (restart) sound.currentTime = 0;
+            const result = sound.play();
+            if (result && typeof result.catch === 'function') {
+                result.catch(error => console.warn('[A350 v3.1.0] Audio playback failed:', name, error));
+            }
+            return true;
+        } catch (error) {
+            console.warn('[A350 v3.1.0] Audio playback failed:', name, error);
+            return false;
+        }
+    }
+
+    function stopAudio(name) {
+        const sound = audio[name];
+        if (!sound) return;
+        try { sound.pause(); sound.currentTime = 0; } catch (_) {}
+    }
+
+    function playClick() { playAudio('click'); }
+
+    function addAudioTimer(callback, delay) {
+        const timer = setTimeout(() => {
+            state.audioTimers = state.audioTimers.filter(id => id !== timer);
+            callback();
+        }, delay);
+        state.audioTimers.push(timer);
+        return timer;
+    }
+
+    function clearAudioTimers() {
+        state.audioTimers.forEach(clearTimeout);
+        state.audioTimers = [];
+    }
+
+    function clearFanVolumeTimer() {
+        if (state.fanVolumeTimer !== null) {
+            clearInterval(state.fanVolumeTimer);
+            state.fanVolumeTimer = null;
+        }
+    }
+
+    function fadeFanVolume(target, duration = FAN_FADE_DURATION) {
+        clearFanVolumeTimer();
+        if (!state.soundEnabled) return;
+        const sound = audio.fanRunning;
+        const startVolume = sound.volume;
+        const difference = target - startVolume;
+        const startTime = Date.now();
+        if (Math.abs(difference) < 0.01) { sound.volume = target; return; }
+
+        state.fanVolumeTimer = setInterval(() => {
+            if (!state.soundEnabled) { clearFanVolumeTimer(); return; }
+            const progress = Math.min(1, (Date.now() - startTime) / duration);
+            sound.volume = Math.max(0, Math.min(1, startVolume + difference * progress));
+            if (progress >= 1) { sound.volume = target; clearFanVolumeTimer(); }
+        }, 50);
+    }
+
+    function clearAPUTimer() {
+        if (state.apuTimer !== null) { clearTimeout(state.apuTimer); state.apuTimer = null; }
+        state.apuRunToken++;
+    }
+
+    function clearEXTAPUStartTimer() {
+        if (state.extApuStartTimer !== null) {
+            clearTimeout(state.extApuStartTimer);
+            state.extApuStartTimer = null;
+        }
+        state.extApuStartToken++;
+    }
+
+    function clearPostFlightAPUTimer() {
+        if (state.postFlightAPUTimer !== null) {
+            clearTimeout(state.postFlightAPUTimer);
+            state.postFlightAPUTimer = null;
+        }
+        state.postFlightAPUToken++;
+    }
+
+    function startPostFlightAPUTimer() {
+        clearPostFlightAPUTimer();
+        const token = state.postFlightAPUToken;
+        state.postFlightAPUTimer = setTimeout(() => {
+            if (token !== state.postFlightAPUToken) return;
+            state.postFlightAPUTimer = null;
+            if (state.image !== 38) return;
+            loadImage(39);
+            console.log('[A350 v3.1.0] Post-flight APU start delay finished — image 39 loaded.');
+        }, POST_FLIGHT_APU_DELAY);
+    }
+
+    function clearEngineTimers() {
+        state.engineTimers.forEach(clearTimeout);
+        state.engineTimers = [];
+        state.eng1Starting = false;
+        state.eng2Starting = false;
+    }
+
+    function stopAllAudio() {
+        clearAudioTimers();
+        clearFanVolumeTimer();
+        Object.keys(audio).forEach(stopAudio);
+        audio.fanStart.onended = null;
+        audio.fanRunning.volume = FAN_NORMAL_VOLUME;
+        audio.fanRunning.loop = true;
+        state.fanSequenceRequested = false;
+    }
+
+    // Fan Start plays once in full; Fan Running then loops continuously.
+    // Repeated requests must not interrupt either sound.
+    function startFanSequence(delay) {
+        if (state.fanSequenceRequested) return;
+        state.fanSequenceRequested = true;
+
+        const start = () => {
+            if (!state.soundEnabled) return;
+            audio.fanRunning.volume = FAN_NORMAL_VOLUME;
+            audio.fanRunning.loop = true;
+            audio.fanStart.onended = () => {
+                audio.fanStart.onended = null;
+                if (state.soundEnabled) playAudio('fanRunning');
+            };
+            playAudio('fanStart');
+        };
+
+        if (delay <= 0) start();
+        else addAudioTimer(start, delay);
+    }
+
+    function playCabinPowerUp(delay = 1000) {
+        playAudio('cabin');
+        addAudioTimer(() => playAudio('seatbelts'), delay);
+    }
+
+    function updateSoundUI() {
+        getDocuments().forEach(doc => {
+            const checkbox = doc.getElementById('a350-sound-toggle');
+            if (checkbox) checkbox.checked = state.soundEnabled;
+        });
+    }
+
+    // ============================================================
+    // CHECKLIST DATA
+    // ============================================================
+
+    const commonInfo = {
+        battery: 'Press BAT 1 and BAT 2 which both are located to the left in the ELEC section.',
+        adirs: 'Press the ADIRS switches in the ADIRS section from left to right.',
+        crew: 'Press the Crew supply button in the oxygen section.',
+        fuel: 'Press all the buttons in the fuel section from left to right.',
+        emer: 'Press the Emer exit lt switch in the Signs section.'
+    };
+
+    const extBoardingChecklist = [
+        { section: 'When boarding is about to begin, we need to turn on the APU.' },
+        { text: 'APU Master ON', info: 'Press the MASTER SWITCH located at the top of the APU section.' },
+        { text: 'APU Start (wait 3 seconds after APU MASTER ON)', info: 'Wait 3 seconds after turning on the MASTER SWITCH, then press the START button under the MASTER SWITCH in the APU section.' },
+        { text: 'APU GEN ON', info: 'Press the button labeled APU GEN to the right in the ELEC section.' },
+        { text: 'APU BLEED ON', info: 'Press APU BLEED in the middle of the AIR section.' },
+        { text: 'PACK 1 ON', info: 'Press PACK 1 at the bottom of the AIR section.' },
+        { text: 'PACK 2 ON', info: 'Press PACK 2 at the bottom of the AIR section.' },
+        { text: 'EXT 1 OFF', info: 'Press EXT 1 in the middle of the ELEC section.' },
+        { text: 'EXT 2 OFF', info: 'Press EXT 2 in the middle of the ELEC section.' },
+        { text: 'Disconnect EXT', info: 'Open GROUND and press DISCONNECT EXT PWR. When the disconnection finishes, the panel automatically advances from image 84 to image 25.' }
+    ];
+
+    const afterBoardingChecklist = [
+        { section: 'After boarding' },
+        { text: 'Seatbelt sign ON', info: 'Press the seatbelt sign switch in the Signs section.' },
+        { text: 'Pack 1 and 2 OFF', info: 'Press PACK 1 and PACK 2 in the AIR section.' },
+        { text: 'ENG Mode selector to IGN/START', info: 'Open the ENG start panel by pressing the button under this checklist and press on the switch in the middle.' },
+        { text: 'Start ENG 2', info: 'Press ENG 2.' },
+        { text: 'Start ENG 1 (wait until ENG 2 has turned on)', info: 'Press ENG 1.' }
+    ];
+
+    const afterStartChecklist = [
+        { section: 'After start' },
+        { text: 'ENG Mode selector to NORM (wait until ENG 1 and 2 is fully turned on)', info: 'Press on the switch in the middle of the box in the bottom right.' },
+        { text: 'ENG 1 and 2 BLEED on', info: 'Press ENG 1 BLEED and ENG 2 BLEED in the top of the AIR section.' },
+        { text: 'Pack 1 and 2 on', info: 'Press PACK 1 and 2 in the bottom of the AIR section.' },
+        { text: 'APU Bleed OFF', info: 'Press APU BLEED which is in the middle of the AIR section.' },
+        { text: 'APU GEN off', info: 'Press APU GEN in ELEC section.' },
+        { text: 'APU MASTER off', info: 'Press APU MASTER in the APU section.' },
+        { text: 'FLAPS', info: 'Test all flap positions and leave it on 1 or 2 after (press F).' },
+        { text: 'SPOILERS', info: 'Test all 3 spoiler positions and leave it ARMED (Press B).' },
+        { text: 'CONTROL', info: 'Test controls by moving mouse or joystick up, down, left and right.' }
+    ];
+
+    const flightAndLandingChecklist = [
+        { section: 'Above 10 000 ft' },
+        { text: 'Seatbelt sign OFF', info: 'Press the seatbelt sign switch in the Signs section.' },
+        { section: 'Between 15 000 - 10 000 ft on descent' },
+        { text: 'Seatbelt sign ON', info: 'Press the seatbelt sign switch in the Signs section.' },
+        { section: 'After landing' },
+        { text: 'APU master sw ON', info: 'Press APU MASTER in the APU section.' },
+        { text: 'APU start ON', info: 'Press the START button under the MASTER SWITCH in the APU section.' },
+        { text: 'APU gen ON (when APU start is AVAIL)', info: 'Press the button labeled APU GEN to the right in the ELEC section.' }
+    ];
+
+    const postFlightChecklist = [
+        { section: 'Post-flight / shutdown' },
+        { text: 'Shut down ENG 1', info: 'Press ENG 1 in the ENG start panel. You do not need to wait for ENG 1 to shut down before shutting down ENG 2.' },
+        { text: 'Shut down ENG 2 (no need to wait for ENG 1)', info: 'Press ENG 2 in the ENG start panel. ENG 1 and ENG 2 can be shut down without waiting for the other engine.' },
+        { text: 'APU bleed ON', info: 'Press APU BLEED in the middle of the AIR section.' },
+        { text: 'Pack 1 and 2 ON', info: 'Press PACK 1 and PACK 2 at the bottom of the AIR section.' },
+        { text: 'Seatbelt sign OFF', info: 'Press the seatbelt sign switch in the Signs section.' }
+    ];
+
+    const checklistData = {
+        extDisconnected: {
+            title: 'EXT — NOT CONNECTED',
+            description: 'EXT has been selected, but external power was not connected before startup.',
+            items: [
+                { text: 'Battery 1 and 2', info: commonInfo.battery },
+                { text: 'Connect EXT', info: 'Open GROUND and press CONNECT EXT PWR.' },
+                { text: 'Turn on EXT 1 and 2 (when they show AVAIL)', info: 'Press EXT 1 and EXT 2, located to the right of BAT 2.' },
+                { text: 'Turn ADIRS 1–3 to NAV', info: commonInfo.adirs },
+                { text: 'Crew supply ON', info: commonInfo.crew },
+                { text: 'Turn on the fuel pumps', info: commonInfo.fuel },
+                { text: 'Arm Emer exit lt', info: commonInfo.emer },
+                { text: 'Program A/P and route', info: '' },
+                ...extBoardingChecklist
+            ]
+        },
+        extConnected: {
+            title: 'EXT — CONNECTED',
+            description: 'External power is connected.',
+            items: [
+                { text: 'Battery 1 and 2', info: commonInfo.battery },
+                { text: 'Turn on EXT 1 and 2 (when they show AVAIL)', info: 'Press EXT 1 and EXT 2, located to the right of BAT 2.' },
+                { text: 'Turn ADIRS 1–3 to NAV', info: commonInfo.adirs },
+                { text: 'Crew supply ON', info: commonInfo.crew },
+                { text: 'Turn on the fuel pumps', info: commonInfo.fuel },
+                { text: 'Arm Emer exit lt', info: commonInfo.emer },
+                { text: 'Program A/P and route', info: '' },
+                ...extBoardingChecklist
+            ]
+        },
+        apu: {
+            title: 'APU START',
+            description: 'APU start checklist.',
+            items: [
+                { text: 'Battery 1 and 2', info: commonInfo.battery },
+                { text: 'APU Master on', info: 'Press the MASTER SWITCH at the top of the APU section.' },
+                { text: 'APU Start (wait 3 seconds after APU MASTER ON)', info: 'Wait 3 seconds after turning on the MASTER SWITCH, then press the START button under the MASTER SWITCH in the APU section.' },
+                { text: 'APU Gen (wait until APU shows AVAIL)', info: 'Press APU GEN to the right in the ELEC section.' },
+                { text: 'APU Bleed on', info: 'Press APU BLEED in the middle of the AIR section.' },
+                { text: 'Pack 1 and 2 ON', info: 'Press PACK 1 and 2 at the bottom of the AIR section.' },
+                { text: 'Turn ADIRS 1–3 to NAV', info: commonInfo.adirs },
+                { text: 'Crew supply ON', info: commonInfo.crew },
+                { text: 'Turn on the fuel pumps', info: commonInfo.fuel },
+                { text: 'Arm Emer exit lt', info: commonInfo.emer },
+                { text: 'Program A/P and route', info: '' }
+            ]
+        }
+    };
+
+    function getChecklistKey() {
+        if (state.startChoice === 'apu') return 'apu';
+        if (state.checklistLocked && state.lockedChecklistKey) return state.lockedChecklistKey;
+        return state.extConnected ? 'extConnected' : 'extDisconnected';
+    }
+
+    // ============================================================
+    // STYLES
+    // ============================================================
+
+    const style = document.createElement('style');
+    style.textContent = `
+        #a350-startup-overlay { position:fixed; inset:0; z-index:999990; display:none; pointer-events:none; font-family:Arial,sans-serif; }
+        #a350-startup-window { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:92vw; height:88vh; display:flex; background:rgba(10,10,10,.97); border:1px solid #555; border-radius:6px; box-shadow:0 10px 40px #000; overflow:hidden; pointer-events:auto; }
+        #a350-left { width:340px; min-width:340px; flex:0 0 340px; display:flex; flex-direction:column; min-height:0; background:#121212; border-right:1px solid #555; color:white; }
+        #a350-left-header { padding:12px 16px; border-bottom:1px solid #444; flex-shrink:0; }
+        #a350-title { font-size:20px; font-weight:bold; }
+        #a350-version { margin-top:3px; color:#888; font-size:11px; }
+        #a350-overhead-button { display:block; width:100%; height:34px; margin-top:10px; background:#222; border:1px solid #666; border-radius:4px; color:white; font-weight:bold; cursor:pointer; }
+        #a350-tabs { display:flex; border-bottom:1px solid #444; flex-shrink:0; }
+        .a350-tab { flex:1; height:36px; border:0; background:transparent; color:#aaa; font-size:11px; font-weight:bold; cursor:pointer; }
+        .a350-tab.active { color:white; background:#292929; }
+        #a350-checklist-content { flex:1 1 auto; min-height:0; overflow-y:auto; padding:12px 14px; }
+        #a350-observation { margin-bottom:14px; padding:9px; background:#222; border:1px solid #666; border-radius:4px; color:#ddd; font-size:11px; font-weight:bold; line-height:1.4; }
+        .a350-section-title { margin:8px 0 10px; color:#bbb; font-size:12px; font-weight:bold; text-transform:uppercase; }
+        .a350-check-item { margin-bottom:12px; color:#eee; font-size:13px; line-height:1.35; }
+        .a350-check-main { display:flex; align-items:flex-start; gap:7px; }
+        .a350-check-main input { width:16px; height:16px; margin:0; flex-shrink:0; cursor:pointer; }
+        .a350-check-text { flex:1; cursor:pointer; }
+        .a350-check-item.checked .a350-check-text { color:#777; text-decoration:line-through; }
+        .a350-more-info { padding:0; border:0; background:transparent; color:#999; font-size:10px; cursor:pointer; white-space:nowrap; }
+        .a350-more-info:hover { color:white; text-decoration:underline; }
+        .a350-info-text { display:none; margin:5px 0 0 23px; padding:7px 8px; background:#191919; border-left:2px solid #666; color:#aaa; font-size:11px; line-height:1.4; }
+        .a350-info-text.visible { display:block; }
+        #a350-eng-area { flex:0 0 auto; margin:0 12px; padding-top:8px; border-top:1px solid #444; }
+        #a350-eng-image-frame { display:none; height:100px; margin-top:10px; overflow:hidden; background:#080808; position:relative; cursor:crosshair; }
+        #a350-eng-image { display:block; position:absolute; top:0; left:0; max-width:none; max-height:none; user-select:none; -webkit-user-drag:none; }
+        #a350-bottom-buttons { display:flex; gap:8px; padding:10px 12px 12px; flex-shrink:0; }
+        .a350-bottom-button { flex:1; padding:9px 5px; background:#222; border:1px solid #666; border-radius:4px; color:white; font-size:11px; font-weight:bold; cursor:pointer; }
+        .a350-bottom-button:hover, .a350-ground-button:hover, #a350-overhead-button:hover { background:#333; }
+        #a350-ground-controls, #a350-settings { display:none; padding:14px; overflow-y:auto; }
+        .a350-ground-button { width:100%; margin-bottom:10px; padding:10px; background:#222; border:1px solid #666; border-radius:4px; color:white; font-size:12px; font-weight:bold; cursor:pointer; }
+        .a350-ground-button:disabled { opacity:.4; cursor:default; }
+        #a350-ext-status { margin-bottom:16px; padding:9px; border:1px solid #555; border-radius:4px; background:#111; color:#aaa; text-align:center; font-size:12px; }
+        .a350-setting { margin-bottom:18px; color:#ddd; font-size:13px; }
+        .a350-setting label { display:flex; align-items:center; gap:8px; cursor:pointer; }
+        #a350-panel-area { position:relative; flex:1; min-width:0; min-height:0; display:flex; align-items:center; justify-content:center; background:#080808; overflow:hidden; }
+        #a350-panel-image-wrapper { position:relative; overflow:hidden; cursor:crosshair; user-select:none; box-shadow:0 0 20px rgba(0,0,0,.7); }
+        #a350-panel-image { display:block; max-width:none; max-height:none; user-select:none; -webkit-user-drag:none; }
+        #a350-panel-topbar { position:absolute; top:10px; left:10px; right:10px; display:flex; justify-content:space-between; align-items:center; pointer-events:none; }
+        #a350-panel-topbar-left { display:flex; align-items:center; gap:8px; pointer-events:none; }
+        #a350-image-number { padding:6px 10px; background:rgba(0,0,0,.75); border:1px solid #555; border-radius:4px; color:white; font-size:12px; }
+        #a350-back { width:36px; height:36px; background:rgba(0,0,0,.75); border:1px solid #777; border-radius:4px; color:white; font-size:22px; line-height:1; cursor:pointer; pointer-events:auto; }
+        #a350-back:hover, #a350-close:hover { background:rgba(70,70,70,.9); }
+        #a350-back:disabled { opacity:.35; cursor:default; }
+        #a350-close { width:36px; height:36px; background:rgba(0,0,0,.75); border:1px solid #777; border-radius:4px; color:white; font-size:20px; cursor:pointer; pointer-events:auto; }
+        #a350-warning { display:none; position:absolute; bottom:20px; left:50%; transform:translateX(-50%); padding:9px 14px; background:rgba(100,0,0,.9); border:1px solid #d33; border-radius:4px; color:#ffb0b0; font-size:12px; font-weight:bold; white-space:nowrap; pointer-events:none; }
+        #a350-startup-menu-button { position:relative; z-index:1000000; white-space:nowrap; }
+        #a350-startup-menu-button.a350-hidden-in-replay { display:none!important; }
+        #a350-startup-modal { position:fixed; inset:0; z-index:1000005; display:none; align-items:center; justify-content:center; background:rgba(0,0,0,.78); pointer-events:auto; }
+        #a350-startup-modal-card { width:min(420px,90vw); padding:22px; background:#171717; border:1px solid #666; border-radius:7px; color:white; box-shadow:0 10px 40px #000; }
+        #a350-startup-modal-card h2 { margin:0 0 16px; font-size:18px; }
+        #a350-startup-modal-card p { color:#bbb; font-size:12px; line-height:1.5; }
+        #a350-startup-modal-card label { display:block; margin:12px 0; font-size:13px; }
+        #a350-startup-modal-card select { width:100%; padding:8px; margin-top:6px; background:#222; color:white; border:1px solid #666; }
+        #a350-startup-modal-card button { width:100%; margin-top:12px; padding:10px; background:#333; border:1px solid #777; border-radius:4px; color:white; font-weight:bold; cursor:pointer; }
+        html.a350-popup-html, body.a350-popup-body { width:100%; height:100%; margin:0; padding:0; overflow:hidden; background:#080808; }
+        #a350-overhead-window { position:fixed!important; inset:0!important; width:100vw!important; height:100vh!important; transform:none!important; margin:0!important; border-radius:0!important; box-sizing:border-box!important; display:flex!important; overflow:hidden!important; }
+        #a350-overhead-window #a350-left { flex:0 0 340px!important; width:340px!important; min-width:340px!important; max-width:340px!important; height:100%!important; box-sizing:border-box!important; }
+        #a350-overhead-window #a350-panel-area { flex:1 1 auto!important; width:auto!important; min-width:0!important; min-height:0!important; height:100%!important; display:flex!important; align-items:center!important; justify-content:center!important; overflow:hidden!important; }
+        #a350-overhead-window #a350-panel-topbar-left { display:flex!important; align-items:center!important; gap:8px!important; }
+        #a350-overhead-window #a350-back, #a350-overhead-window #a350-close { pointer-events:auto!important; }
+        #a350-overhead-window #a350-overhead-button, #a350-overhead-window #a350-startup-modal { display:none!important; }
+    `;
+    document.head.appendChild(style);
+
+    // ============================================================
+    // DOCUMENT HELPERS
+    // ============================================================
+
+    function getOverheadDocument() {
+        try { if (overheadWindow && !overheadWindow.closed) return overheadWindow.document; } catch (_) {}
+        overheadWindow = null;
+        return null;
+    }
+
+    function getDocuments() {
+        const docs = [document];
+        const popupDoc = getOverheadDocument();
+        if (popupDoc) docs.push(popupDoc);
+        return docs;
+    }
+
+    function syncText(id, text) {
+        getDocuments().forEach(doc => {
+            const element = doc.getElementById(id);
+            if (element) element.textContent = text;
+        });
+    }
+
+    function syncImageNumber() { syncText('a350-image-number', 'PANEL ' + state.image); }
+
+    function showWarning(message) {
+        getDocuments().forEach(doc => {
+            const warning = doc.getElementById('a350-warning');
+            if (warning) { warning.textContent = message; warning.style.display = 'block'; }
+        });
+    }
+
+    function hideWarning() {
+        getDocuments().forEach(doc => {
+            const warning = doc.getElementById('a350-warning');
+            if (warning) warning.style.display = 'none';
+        });
+    }
+
+    // ============================================================
+    // SEQUENCE TRACKING
+    // ============================================================
+
+    function getActiveSequence() {
+        if (state.startChoice === 'apu') return APU_SEQUENCE;
+        if (state.startChoice === 'ext') {
+            if (state.extConnectedDuringSequence) return EXT_SEQUENCE_CONNECTED_LATER;
+            if (state.extInitiallyConnected && state.extConnected) return EXT_SEQUENCE_CONNECTED_INITIALLY;
+            return EXT_SEQUENCE_CONNECTED_LATER;
+        }
+        return null;
+    }
+
+    function resetSequenceCursor() {
+        const sequence = getActiveSequence();
+        const index = sequence ? sequence.indexOf(state.image) : -1;
+        state.sequenceIndex = index >= 0 ? index : 0;
+    }
+
+    function updateSequenceCursor(previousImage, newImage) {
+        if (!state.startChoice || previousImage === newImage) return;
+        const sequence = getActiveSequence();
+        if (!sequence) return;
+        if (sequence[state.sequenceIndex] === previousImage && sequence[state.sequenceIndex + 1] === newImage) {
+            state.sequenceIndex++;
+            return;
+        }
+        for (let i = Math.max(0, state.sequenceIndex); i < sequence.length - 1; i++) {
+            if (sequence[i] === previousImage && sequence[i + 1] === newImage) {
+                state.sequenceIndex = i + 1;
+                return;
+            }
+        }
+        let bestIndex = -1;
+        let bestDistance = Infinity;
+        for (let i = 0; i < sequence.length; i++) {
+            if (sequence[i] !== newImage) continue;
+            const distance = Math.abs(i - state.sequenceIndex);
+            if (distance < bestDistance) { bestDistance = distance; bestIndex = i; }
+        }
+        if (bestIndex >= 0) state.sequenceIndex = bestIndex;
+    }
+
+    // ============================================================
+    // IMAGE CROPPING AND LOADING
+    // ============================================================
+
+    function fitCroppedImage(doc, imageId, wrapperId, panelId, src, cropTop) {
+        const image = doc.getElementById(imageId);
+        const wrapper = doc.getElementById(wrapperId);
+        const panel = doc.getElementById(panelId);
+        if (!image || !wrapper || !panel) return;
+
+        image.onload = () => {
+            const naturalWidth = image.naturalWidth || 1414;
+            const naturalHeight = image.naturalHeight || 2000;
+            const cropHeight = Math.max(1, naturalHeight - cropTop);
+            const availableWidth = Math.max(100, panel.clientWidth - 24);
+            const availableHeight = Math.max(100, panel.clientHeight * 0.96);
+            const scale = Math.min(availableWidth / naturalWidth, availableHeight / cropHeight);
+            wrapper.style.width = (naturalWidth * scale) + 'px';
+            wrapper.style.height = (cropHeight * scale) + 'px';
+            image.style.width = (naturalWidth * scale) + 'px';
+            image.style.height = (naturalHeight * scale) + 'px';
+            image.style.transform = 'translateY(-' + (cropTop * scale) + 'px)';
+            image.style.transformOrigin = 'top left';
+        };
+        image.onerror = () => console.error('[A350 v3.1.0] Could not load image:', src);
+        image.src = src;
+    }
+
+    function setEngPanelVisibility(open, buttonText = null, buttonDisabled = false) {
+        getDocuments().forEach(doc => {
+            const frame = doc.getElementById('a350-eng-image-frame');
+            const button = doc.getElementById('a350-eng-toggle');
+            if (frame) frame.style.display = open ? 'block' : 'none';
+            if (button) {
+                button.textContent = buttonText || (open ? 'CLOSE' : 'OPEN');
+                button.disabled = buttonDisabled;
+            }
+        });
+    }
+
+    function beginEngineStart() {
+        if (state.engineStartPanelActive || state.engineStartPanelComplete || state.engNormReached) return;
+        state.engineStartPanelActive = true;
+        state.engPanelOpen = true;
+        state.engImage = 89;
+        state.engMode = 'NORM';
+        state.currentTab = 'before';
+        showTab('before');
+        setEngPanelVisibility(true, 'LOCKED OPEN', true);
+        loadEngImage(89);
+        console.log('[A350 v3.1.0] ENG start panel automatically unlocked/opened at overhead image 28.');
+    }
+
+    function finishEngineStart() {
+        state.engineStartPanelActive = false;
+        state.engineStartPanelComplete = true;
+        state.engNormReached = true;
+        state.engPanelOpen = false;
+        setEngPanelVisibility(false, 'LOCKED', true);
+        console.log('[A350 v3.1.0] ENG start complete at image 93 (NORM); ENG panel automatically closed and locked.');
+    }
+
+    function beginPostFlightShutdown() {
+        if (state.postFlightShutdownComplete) return;
+        state.postFlightShutdownActive = true;
+        state.engPanelOpen = true;
+        state.engImage = 93;
+        state.currentTab = 'before';
+        showTab('before');
+        setEngPanelVisibility(true, 'LOCKED OPEN', true);
+        loadEngImage(93);
+        console.log('[A350 v3.1.0] Post-flight shutdown mode active at overhead image 40.');
+    }
+
+    function finishPostFlightShutdown() {
+        state.postFlightShutdownActive = false;
+        state.postFlightShutdownComplete = true;
+        state.engPanelOpen = false;
+        setEngPanelVisibility(false, 'LOCKED', true);
+        console.log('[A350 v3.1.0] Both engine shutdown commands sent; ENG panel locked.');
+    }
+
+    function loadImage(number) {
+        const previousImage = state.image;
+        const newImage = Math.max(1, Number(number) || 1);
+
+        // Cancel the automatic APU delay if the user/script leaves image 38.
+        if (newImage !== 38 && state.postFlightAPUTimer !== null) {
+            clearPostFlightAPUTimer();
+        }
+
+        updateSequenceCursor(previousImage, newImage);
+        state.image = newImage;
+        syncImageNumber();
+
+        // Engine start is a locked, automatic ENG-panel sequence at overhead image 28.
+        if (state.image === 28 && !state.engNormReached && !state.postFlightShutdownActive && !state.engineStartPanelComplete) {
+            beginEngineStart();
+        }
+
+        getDocuments().forEach(doc => fitCroppedImage(
+            doc, 'a350-panel-image', 'a350-panel-image-wrapper', 'a350-panel-area',
+            IMAGE_BASE + state.image + '.png', CROP_TOP
+        ));
+
+        // Image 40 locks normal overhead navigation and opens ENG shutdown controls.
+        if (state.image === 40 && previousImage !== 40 && !state.postFlightShutdownComplete) {
+            beginPostFlightShutdown();
+        }
+
+        // The shutdown ENG image and the large overhead image are paired.
+        if (state.engPanelOpen && state.image === 41) loadEngImage(94);
+        else if (state.engPanelOpen && state.image === 42) loadEngImage(95);
+
+        hideWarning();
+
+        if (previousImage !== state.image) {
+            if (state.image === 26) playAudio('seatbelts');
+            if (state.image === 27) fadeFanVolume(FAN_LOW_VOLUME);
+            if (state.image === 31) fadeFanVolume(FAN_NORMAL_VOLUME);
+            if (previousImage === 35 && state.image === 36) playAudio('seatbelts');
+            if (previousImage === 36 && state.image === 35) playAudio('seatbelts');
+            if (previousImage === 45 && state.image === 25) playAudio('seatbelts');
+
+            // After landing: image 37 -> 38, wait 8 seconds, then automatically show 39.
+            if (previousImage === 37 && state.image === 38) {
+                startPostFlightAPUTimer();
+            }
+        }
+
+        if (state.startChoice === 'apu' && state.image === 11 && !state.apuGenSoundsPlayed) {
+            state.apuGenSoundsPlayed = true;
+            playCabinPowerUp(1000);
+        }
+
+        if (state.startChoice === 'ext' && state.extInitiallyConnected && state.extConnected && state.image === 6 && !state.extSoundsStarted) {
+            startEXTSounds();
+        }
+    }
+
+    function loadEngImage(number) {
+        state.engImage = Math.max(89, Math.min(95, Number(number) || 89));
+
+        // Image 93 is the only image that changes the mode/marks the start sequence complete.
+        // Images 94 and 95 are shutdown controls and must not change the selector state.
+        if (state.engImage === 93) {
+            state.engMode = 'NORM';
+            state.engNormReached = true;
+        }
+
+        getDocuments().forEach(doc => {
+            const image = doc.getElementById('a350-eng-image');
+            const frame = doc.getElementById('a350-eng-image-frame');
+            if (!image || !frame) return;
+
+            image.onload = () => {
+                const naturalWidth = image.naturalWidth || 1414;
+                const naturalHeight = image.naturalHeight || 2000;
+                const visibleHeight = Math.max(1, naturalHeight - ENG_CROP_TOP);
+                const scale = Math.min((frame.clientWidth - 4) / naturalWidth, (frame.clientHeight - 4) / visibleHeight);
+                image.style.width = (naturalWidth * scale) + 'px';
+                image.style.height = (naturalHeight * scale) + 'px';
+                image.style.transform = 'translateY(-' + (ENG_CROP_TOP * scale) + 'px)';
+                image.style.transformOrigin = 'top left';
+                image.style.left = Math.max(0, (frame.clientWidth - naturalWidth * scale) / 2) + 'px';
+            };
+            image.onerror = () => console.error('[A350 v3.1.0] Could not load ENG image:', state.engImage);
+            image.src = ENG_BASE + state.engImage + '.png';
+        });
+    }
+
+    // ============================================================
+    // CHECKLIST RENDERING
+    // ============================================================
+
+    function resetChecklist() {
+        getDocuments().forEach(doc => {
+            doc.querySelectorAll('#a350-checklist-content input[type="checkbox"]').forEach(checkbox => {
+                checkbox.checked = false;
+                const item = checkbox.closest('.a350-check-item');
+                if (item) item.classList.remove('checked');
+            });
+        });
+    }
+
+    function createChecklistItem(item, container, doc, checked = false) {
+        if (item.section) {
+            const heading = doc.createElement('div');
+            heading.className = 'a350-section-title';
+            heading.style.marginTop = '20px';
+            heading.textContent = item.section;
+            container.appendChild(heading);
+            return;
+        }
+
+        const wrapper = doc.createElement('div');
+        wrapper.className = 'a350-check-item';
+        const main = doc.createElement('div');
+        main.className = 'a350-check-main';
+        const checkbox = doc.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = checked;
+        if (checked) wrapper.classList.add('checked');
+
+        const text = doc.createElement('span');
+        text.className = 'a350-check-text';
+        text.textContent = item.text;
+
+        const infoButton = doc.createElement('button');
+        infoButton.type = 'button';
+        infoButton.className = 'a350-more-info';
+        infoButton.textContent = '[ More info ]';
+        infoButton.style.display = item.info ? '' : 'none';
+
+        const info = doc.createElement('div');
+        info.className = 'a350-info-text';
+        info.textContent = item.info;
+
+        checkbox.addEventListener('change', () => wrapper.classList.toggle('checked', checkbox.checked));
+        infoButton.addEventListener('click', event => {
+            event.preventDefault(); event.stopPropagation(); playClick(); info.classList.toggle('visible');
+        });
+
+        main.append(checkbox, text, infoButton);
+        wrapper.append(main, info);
+        container.appendChild(wrapper);
+    }
+
+    function renderChecklist(doc) {
+        const content = doc.getElementById('a350-checklist-content');
+        if (!content) return;
+        const previousChecks = new Map();
+        content.querySelectorAll('.a350-check-item').forEach(wrapper => {
+            const text = wrapper.querySelector('.a350-check-text');
+            const checkbox = wrapper.querySelector('input[type="checkbox"]');
+            if (text && checkbox) previousChecks.set(text.textContent, checkbox.checked);
+        });
+        content.innerHTML = '';
+
+        const observation = doc.createElement('div');
+        observation.id = 'a350-observation';
+        observation.textContent = 'OBS! Every button has to be pushed from left to right (except the engines)';
+        content.appendChild(observation);
+
+        const key = getChecklistKey();
+        const data = checklistData[key];
+        if (key === 'apu') {
+            const title = doc.createElement('div');
+            title.className = 'a350-section-title';
+            title.textContent = data.title;
+            content.appendChild(title);
+            const description = doc.createElement('p');
+            description.style.cssText = 'color:#aaa;font-size:11px;line-height:1.4;margin:0 0 14px;';
+            description.textContent = data.description;
+            content.appendChild(description);
+        }
+
+        [
+            ...data.items,
+            ...afterBoardingChecklist,
+            ...afterStartChecklist,
+            ...flightAndLandingChecklist,
+            ...postFlightChecklist
+        ].forEach(item => createChecklistItem(item, content, doc, previousChecks.get(item.text) === true));
+    }
+
+    function refreshChecklist() { getDocuments().forEach(renderChecklist); }
+
+    // ============================================================
+    // EXT GROUND CONTROLS
+    // ============================================================
+
+    function updateEXTUI() {
+        getDocuments().forEach(doc => {
+            const status = doc.getElementById('a350-ext-status');
+            const connect = doc.getElementById('a350-ext-connect');
+            const disconnect = doc.getElementById('a350-ext-disconnect');
+            if (status) status.textContent = state.extBusy
+                ? 'EXT PWR — CONNECTING / DISCONNECTING...'
+                : state.extConnected ? 'EXT PWR — CONNECTED / AVAIL' : 'EXT PWR — DISCONNECTED';
+            if (connect) connect.disabled = state.extBusy || state.extConnected;
+            if (disconnect) disconnect.disabled = state.extBusy || !state.extConnected;
+        });
+    }
+
+    function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+    async function connectEXT() {
+        if (state.extBusy || state.extConnected) return;
+        const imageBeforeConnect = state.image;
+        const wasInExtSequence = state.startChoice === 'ext';
+        state.extBusy = true;
+        const token = ++state.extTimerToken;
+        updateEXTUI();
+        await wait(EXT_DELAY);
+        if (token !== state.extTimerToken) return;
+        state.extConnected = true;
+        state.extBusy = false;
+
+        if (wasInExtSequence) {
+            if (imageBeforeConnect === 1 && state.image === 1) {
+                state.extInitiallyConnected = true;
+                state.extConnectedDuringSequence = false;
+            } else {
+                state.extConnectedDuringSequence = true;
+                state.extInitiallyConnected = false;
+            }
+        }
+        updateEXTUI();
+        refreshChecklist();
+        if (wasInExtSequence && imageBeforeConnect === 3 && state.image === 3) loadImage(4);
+    }
+
+    async function disconnectEXT() {
+        if (state.extBusy || !state.extConnected) return;
+        const disconnectAtBoardingStep = state.startChoice === 'ext' && state.image === 84;
+        state.extBusy = true;
+        const token = ++state.extTimerToken;
+        updateEXTUI();
+        await wait(EXT_DELAY);
+        if (token !== state.extTimerToken) return;
+        state.extConnected = false;
+        state.extBusy = false;
+        state.extInitiallyConnected = false;
+        state.extConnectedDuringSequence = false;
+
+        if (disconnectAtBoardingStep) {
+            // Do not interrupt Fan Start or Fan Running when EXT is disconnected.
+            stopAudio('cabin');
+            stopAudio('seatbelts');
+            state.extSoundsStarted = true;
+            loadImage(25);
+        }
+        updateEXTUI();
+        refreshChecklist();
+    }
+
+    // ============================================================
+    // STARTUP SOUND SEQUENCES
+    // ============================================================
+
+    function startAPUSounds() {
+        startFanSequence(FAN_START_DELAY_APU);
+    }
+
+    function startEXTSounds() {
+        if (state.extSoundsStarted) return;
+        state.extSoundsStarted = true;
+        playCabinPowerUp(1000);
+        startFanSequence(FAN_START_DELAY_EXT);
+    }
+
+    // ============================================================
+    // APU START SEQUENCE
+    // ============================================================
+
+    function startAPUSequence() {
+        if (state.startChoice !== 'apu' || state.image !== 9) return;
+        if (state.apuStarted || state.apuAvailable) return;
+        state.apuStarted = true;
+        state.apuAvailable = false;
+        const runToken = ++state.apuRunToken;
+        state.apuTimer = setTimeout(() => {
+            if (runToken !== state.apuRunToken) return;
+            state.apuTimer = null;
+            if (state.startChoice !== 'apu' || !state.apuStarted || state.image !== 9) {
+                console.warn('[A350 v3.1.0] APU timer cancelled or sequence changed.');
+                return;
+            }
+            state.apuAvailable = true;
+            loadImage(10);
+            console.log('[A350 v3.1.0] APU AVAIL — image 10 loaded automatically.');
+        }, APU_READY_DELAY);
+        startAPUSounds();
+        console.log('[A350 v3.1.0] APU startup started from image 8.');
+    }
+
+    // ============================================================
+    // EXT APU START — IMAGE 77 TO IMAGE 78
+    // ============================================================
+
+    function startEXTAPUStartDelay() {
+        clearEXTAPUStartTimer();
+        const runToken = state.extApuStartToken;
+        state.extApuStartTimer = setTimeout(() => {
+            if (runToken !== state.extApuStartToken) return;
+            state.extApuStartTimer = null;
+            if (state.startChoice !== 'ext' || state.image !== 77) return;
+            loadImage(78);
+            console.log('[A350 v3.1.0] EXT APU start delay finished — image 78 loaded.');
+        }, EXT_APU_START_DELAY);
+    }
+
+    // ============================================================
+    // PANEL IMAGE FLOW
+    // ============================================================
+
+    function getNextImage() {
+        const sequence = getActiveSequence();
+        if (!sequence) return null;
+        if (sequence[state.sequenceIndex] === state.image) {
+            return state.sequenceIndex >= sequence.length - 1 ? null : sequence[state.sequenceIndex + 1];
+        }
+        for (let i = Math.max(0, state.sequenceIndex); i < sequence.length - 1; i++) {
+            if (sequence[i] === state.image) { state.sequenceIndex = i; return sequence[i + 1]; }
+        }
+        return null;
+    }
+
+    function getPreviousImage() {
+        const sequence = getActiveSequence();
+        if (!sequence) return null;
+
+        const cursor = Math.max(0, Math.min(state.sequenceIndex, sequence.length - 1));
+        if (sequence[cursor] === state.image) {
+            return cursor > 0 ? sequence[cursor - 1] : null;
+        }
+
+        // Prefer the closest matching occurrence at or before the current cursor.
+        for (let i = cursor; i >= 0; i--) {
+            if (sequence[i] === state.image) {
+                state.sequenceIndex = i;
+                return i > 0 ? sequence[i - 1] : null;
+            }
+        }
+
+        // If the sequence cursor is temporarily stale, use the closest occurrence.
+        let bestIndex = -1;
+        let bestDistance = Infinity;
+        for (let i = 0; i < sequence.length; i++) {
+            if (sequence[i] !== state.image) continue;
+            const distance = Math.abs(i - cursor);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                bestIndex = i;
+            }
+        }
+        if (bestIndex >= 0) {
+            state.sequenceIndex = bestIndex;
+            return bestIndex > 0 ? sequence[bestIndex - 1] : null;
+        }
+        return null;
+    }
+
+    function handlePreviousImage() {
+        playClick();
+
+        if (!state.startChoice) {
+            showWarning('Choose APU or EXT first.');
+            return;
+        }
+        if (state.image === 38 && state.postFlightAPUTimer !== null) {
+            showWarning('Wait until the APU start delay finishes.');
+            return;
+        }
+        if (state.image === 28 && !state.engNormReached) {
+            showWarning('Complete the ENG start sequence and reach image 93 (NORM) first.');
+            return;
+        }
+        if (state.postFlightShutdownActive && [40, 41, 42].includes(state.image)) {
+            showWarning('Overhead navigation is locked. Finish the ENG shutdown sequence first.');
+            return;
+        }
+
+        const previous = getPreviousImage();
+        if (previous === null) {
+            showWarning('This is the first image in the current sequence.');
+            return;
+        }
+        if (state.postFlightShutdownComplete && [40, 41, 42].includes(previous)) {
+            showWarning('The engine shutdown sequence is complete; you cannot return to its locked steps.');
+            return;
+        }
+
+        loadImage(previous);
+    }
+
+    function handlePanelClick() {
+        if (state.startChoice === 'apu' && state.image === 9) return;
+        if (state.startChoice === 'ext' && state.image === 77 && state.extApuStartTimer !== null) return;
+        if (state.image === 38 && state.postFlightAPUTimer !== null) return;
+        if (state.postFlightShutdownActive && [40, 41, 42].includes(state.image)) {
+            showWarning('Overhead navigation is locked. Use the ENG panel to shut down ENG 1 and ENG 2.');
+            return;
+        }
+        playClick();
+        if (!state.startChoice) { showWarning('Choose APU or EXT first.'); return; }
+        if (state.image === 28 && !state.engNormReached) {
+            showWarning('Complete the ENG start sequence and reach image 93 (NORM) first.');
+            return;
+        }
+        if (state.startChoice === 'apu' && state.image === 8) {
+            loadImage(9); startAPUSequence(); return;
+        }
+        if (state.startChoice === 'apu' && state.image === 10) {
+            if (!state.apuAvailable) { showWarning('Wait until the APU shows AVAIL.'); return; }
+            loadImage(11); return;
+        }
+        if (state.startChoice === 'ext' && state.image === 76) {
+            loadImage(77); startEXTAPUStartDelay(); return;
+        }
+        if (state.startChoice === 'ext' && state.image === 77) return;
+        if (state.startChoice === 'ext' && state.extConnectedDuringSequence && state.extConnected && state.image === 5) {
+            startEXTSounds(); loadImage(6); return;
+        }
+        if (state.startChoice === 'ext' && state.extInitiallyConnected && state.extConnected && state.image === 6) {
+            if (!state.extSoundsStarted) startEXTSounds();
+            const next = getNextImage();
+            if (next !== null) loadImage(next);
+            return;
+        }
+
+        const previousImage = state.image;
+        const next = getNextImage();
+        if (next === null) { showWarning('End of this startup sequence.'); return; }
+        if (state.startChoice === 'ext' && previousImage === 2 && next === 3 && !state.extConnected && !state.extInitiallyConnected) {
+            state.checklistLocked = true;
+            state.lockedChecklistKey = 'extDisconnected';
+        }
+        loadImage(next);
+    }
+
+    // ============================================================
+    // GEOFS ENGINE START / STOP FUNCTIONS
+    // ============================================================
+
+    function getAircraft() {
+        if (typeof window.geofs === 'undefined' || !window.geofs.aircraft || !window.geofs.aircraft.instance) return null;
+        return window.geofs.aircraft.instance;
+    }
+
+    function getEngineStatus(engineNumber) {
+        const aircraft = getAircraft();
+        if (!aircraft) return null;
+        const index = engineNumber - 1;
+        const candidates = [];
+        if (Array.isArray(aircraft.engines)) candidates.push(aircraft.engines[index]);
+        if (aircraft.engine && Array.isArray(aircraft.engine.engines)) candidates.push(aircraft.engine.engines[index]);
+        const engine = candidates.find(Boolean);
+
+        if (engine && typeof engine === 'object') {
+            for (const key of ['running', 'isRunning', 'started', 'isStarted']) {
+                if (typeof engine[key] === 'boolean') return engine[key];
+            }
+            for (const key of ['rpm', 'N1', 'n1', 'rotationSpeed', 'speed']) {
+                if (typeof engine[key] === 'number') return engine[key] > 0.1;
+            }
+        }
+        const directKeys = [`engine${engineNumber}Running`, `engine${engineNumber}Started`, `eng${engineNumber}Running`, `eng${engineNumber}Started`];
+        for (const key of directKeys) if (typeof aircraft[key] === 'boolean') return aircraft[key];
+        return null;
+    }
+
+    // Success requires status === true continuously for 3 seconds.
+    // False/null resets the stability timer; reaching the overall timeout is failure.
+    function waitForEngineStart(engineNumber, onStarted, onFailed) {
+        const startTime = Date.now();
+        let stableSince = null;
+        let finished = false;
+        let timer = null;
+
+        function removeTimer() {
+            if (timer !== null) {
+                clearTimeout(timer);
+                state.engineTimers = state.engineTimers.filter(id => id !== timer);
+                timer = null;
+            }
+        }
+
+        function finish(success) {
+            if (finished) return;
+            finished = true;
+            removeTimer();
+            if (success) onStarted();
+            else onFailed();
+        }
+
+        function schedule() {
+            const scheduledTimer = setTimeout(() => {
+                state.engineTimers = state.engineTimers.filter(id => id !== scheduledTimer);
+                if (timer === scheduledTimer) timer = null;
+                poll();
+            }, ENGINE_POLL_INTERVAL);
+            timer = scheduledTimer;
+            state.engineTimers.push(scheduledTimer);
+        }
+
+        function poll() {
+            if (finished) return;
+            const status = getEngineStatus(engineNumber);
+            const now = Date.now();
+
+            if (status === true) {
+                if (stableSince === null) stableSince = now;
+                if (
+                    now - startTime >= ENGINE_MIN_START_DURATION &&
+                    now - stableSince >= ENGINE_STABLE_DURATION
+                ) {
+                    finish(true);
+                    return;
+                }
+            } else {
+                stableSince = null;
+            }
+
+            if (now - startTime >= ENGINE_START_FALLBACK) {
+                finish(false);
+                return;
+            }
+            schedule();
+        }
+
+        schedule();
+    }
+
+    function startEngine1() {
+        if (state.image !== 28 || !state.engPanelOpen) {
+            showWarning('The ENG START panel can only be used when overhead image 28 is displayed and the panel is open.');
+            return false;
+        }
+        const aircraft = getAircraft();
+        if (!aircraft) {
+            console.warn('[A350 v3.1.0] Aircraft not available.');
+            showWarning('GeoFS aircraft is not available.');
+            return false;
+        }
+        try {
+            state.eng1Started = false;
+            state.eng1Starting = true;
+            aircraft.startEngines(0);
+            console.log('[A350 v3.1.0] ENGINE 1 START COMMAND SENT.');
+            waitForEngineStart(1, () => {
+                state.eng1Starting = false;
+                state.eng1Started = true;
+                console.log('[A350 v3.1.0] ENGINE 1 START SEQUENCE COMPLETE (stable status confirmed).');
+            }, () => {
+                state.eng1Starting = false;
+                state.eng1Started = false;
+                console.warn('[A350 v3.1.0] ENGINE 1 START NOT CONFIRMED before timeout.');
+                showWarning('ENG 1 did not reach a stable running state. Check the engine and try again.');
+            });
+            return true;
+        } catch (error) {
+            state.eng1Starting = false;
+            state.eng1Started = false;
+            console.error('[A350 v3.1.0] ENGINE 1 START ERROR:', error);
+            showWarning('Could not start engine 1.');
+            return false;
+        }
+    }
+
+    function startEngine2() {
+        if (state.image !== 28 || !state.engPanelOpen) {
+            showWarning('The ENG START panel can only be used when overhead image 28 is displayed and the panel is open.');
+            return false;
+        }
+        const aircraft = getAircraft();
+        if (!aircraft) {
+            console.warn('[A350 v3.1.0] Aircraft not available.');
+            showWarning('GeoFS aircraft is not available.');
+            return false;
+        }
+        try {
+            state.eng2Started = false;
+            state.eng2Starting = true;
+            aircraft.startEngines(1);
+            console.log('[A350 v3.1.0] ENGINE 2 START COMMAND SENT.');
+            waitForEngineStart(2, () => {
+                state.eng2Starting = false;
+                state.eng2Started = true;
+                console.log('[A350 v3.1.0] ENGINE 2 START SEQUENCE COMPLETE (stable status confirmed).');
+            }, () => {
+                state.eng2Starting = false;
+                state.eng2Started = false;
+                console.warn('[A350 v3.1.0] ENGINE 2 START NOT CONFIRMED before timeout.');
+                showWarning('ENG 2 did not reach a stable running state. Check the engine and try again.');
+            });
+            return true;
+        } catch (error) {
+            state.eng2Starting = false;
+            state.eng2Started = false;
+            console.error('[A350 v3.1.0] ENGINE 2 START ERROR:', error);
+            showWarning('Could not start engine 2.');
+            return false;
+        }
+    }
+
+    function stopEngine(engineNumber) {
+        const aircraft = getAircraft();
+        if (!aircraft) {
+            showWarning('GeoFS aircraft is not available.');
+            return false;
+        }
+        if (typeof aircraft.stopEngines !== 'function') {
+            showWarning('This GeoFS aircraft does not expose the engine shutdown function.');
+            return false;
+        }
+
+        try {
+            // GeoFS engine indices: ENG 1 = 0; ENG 2 = 1.
+            if (engineNumber === 1) state.eng1Stopping = true;
+            else state.eng2Stopping = true;
+
+            aircraft.stopEngines(engineNumber - 1);
+
+            if (engineNumber === 1) {
+                state.eng1Started = false;
+                state.eng1Starting = false;
+                state.eng1Stopping = false;
+            } else {
+                state.eng2Started = false;
+                state.eng2Starting = false;
+                state.eng2Stopping = false;
+            }
+
+            console.log(`[A350 v3.1.0] ENGINE ${engineNumber} STOP COMMAND SENT.`);
+            return true;
+        } catch (error) {
+            if (engineNumber === 1) state.eng1Stopping = false;
+            else state.eng2Stopping = false;
+            console.error(`[A350 v3.1.0] ENGINE ${engineNumber} STOP ERROR:`, error);
+            showWarning(`Could not shut down engine ${engineNumber}.`);
+            return false;
+        }
+    }
+
+    function handleEngPanelClick() {
+        // Do not allow clicks to act on a hidden or locked engine panel.
+        if (!state.engPanelOpen) {
+            showWarning('The ENG panel is locked.');
+            return;
+        }
+
+        playClick();
+
+        // Normal startup flow at overhead image 28.
+        if (state.image === 28) {
+            if (state.engImage === 89) {
+                state.engMode = 'NORM';
+                loadEngImage(90);
+                return;
+            }
+            if (state.engImage === 90) {
+                state.engMode = 'IGN/START';
+                loadEngImage(91);
+                startEngine2();
+                return;
+            }
+            if (state.engImage === 91) {
+                if (state.eng2Starting) { showWarning('Wait for ENG 2 to finish starting.'); return; }
+                if (!state.eng2Started) { showWarning('ENG 2 has not completed its start sequence.'); return; }
+                loadEngImage(92);
+                startEngine1();
+                return;
+            }
+            if (state.engImage === 92) {
+                if (state.eng1Starting) { showWarning('Wait for ENG 1 to finish starting.'); return; }
+                if (!state.eng1Started) { showWarning('ENG 1 has not completed its start sequence.'); return; }
+                loadEngImage(93);
+                state.engMode = 'NORM';
+                finishEngineStart();
+                return;
+            }
+            if (state.engImage === 93) {
+                state.engMode = 'NORM';
+                showWarning('Engine start sequence complete.');
+                return;
+            }
+        }
+
+        // At overhead image 40, image 93 is the starting point for shutdown.
+        // First show image 94 together with overhead image 41; the click on 94
+        // then sends the ENG 1 shutdown command and advances to image 95 / overhead 42.
+        if (state.postFlightShutdownActive && state.image === 40 && state.engImage === 93) {
+            loadEngImage(94);
+            loadImage(41);
+            return;
+        }
+
+        if (state.postFlightShutdownActive && state.image === 41 && state.engImage === 94) {
+            if (state.eng1Stopping) {
+                showWarning('ENG 1 shutdown command is already being processed.');
+                return;
+            }
+            if (stopEngine(1)) {
+                loadEngImage(95);
+                loadImage(42);
+            }
+            return;
+        }
+
+        if (state.postFlightShutdownActive && state.image === 42 && state.engImage === 95) {
+            if (state.eng2Stopping) {
+                showWarning('ENG 2 shutdown command is already being processed.');
+                return;
+            }
+            if (stopEngine(2)) {
+                finishPostFlightShutdown();
+                loadImage(43);
+            }
+            return;
+        }
+
+        showWarning('Use the ENG panel at overhead image 28 for engine start, or follow the post-flight shutdown sequence from overhead image 40.');
+    }
+
+    // ============================================================
+    // COLD & DARK
+    // ============================================================
+
+    function applyColdAndDark() {
+        stopAllAudio();
+        clearAPUTimer();
+        clearEXTAPUStartTimer();
+        clearPostFlightAPUTimer();
+        clearEngineTimers();
+        state.image = 1;
+        state.sequenceIndex = 0;
+        state.startChoice = null;
+        state.firstOpen = true;
+        state.panelPosition = 'center';
+        state.apuStarted = false;
+        state.apuAvailable = false;
+        state.apuGenSoundsPlayed = false;
+        state.checklistLocked = false;
+        state.lockedChecklistKey = null;
+        state.extConnected = false;
+        state.extBusy = false;
+        state.extConnectedDuringSequence = false;
+        state.extInitiallyConnected = false;
+        state.extSoundsStarted = false;
+        state.fanSequenceRequested = false;
+        state.extTimerToken++;
+        state.engPanelOpen = false;
+        state.postFlightShutdownActive = false;
+        state.postFlightShutdownComplete = false;
+        state.engImage = 89;
+        state.eng1Started = false;
+        state.eng2Started = false;
+        state.eng1Starting = false;
+        state.eng2Starting = false;
+        state.eng1Stopping = false;
+        state.eng2Stopping = false;
+        state.engMode = 'NORM';
+        state.engNormReached = false;
+        state.engineStartPanelActive = false;
+        state.engineStartPanelComplete = false;
+        getDocuments().forEach(doc => {
+            const frame = doc.getElementById('a350-eng-image-frame');
+            const button = doc.getElementById('a350-eng-toggle');
+            if (frame) frame.style.display = 'none';
+            if (button) { button.textContent = 'OPEN'; button.disabled = false; }
+        });
+        loadImage(1);
+        loadEngImage(89);
+        resetChecklist();
+        updateEXTUI();
+        refreshChecklist();
+        hideWarning();
+        const modal = document.getElementById('a350-startup-modal');
+        if (modal && state.open) modal.style.display = 'flex';
+    }
+
+    // ============================================================
+    // TABS
+    // ============================================================
+
+    function applyTabToDocument(doc, tab) {
+        const checklist = doc.getElementById('a350-checklist-content');
+        const ground = doc.getElementById('a350-ground-controls');
+        const settings = doc.getElementById('a350-settings');
+        const engArea = doc.getElementById('a350-eng-area');
+        const bottomButtons = doc.getElementById('a350-bottom-buttons');
+        doc.querySelectorAll('.a350-tab').forEach(button => button.classList.toggle('active', button.dataset.tab === tab));
+        if (checklist) checklist.style.display = tab === 'before' ? 'block' : 'none';
+        if (ground) ground.style.display = tab === 'ground' ? 'block' : 'none';
+        if (settings) settings.style.display = tab === 'settings' ? 'block' : 'none';
+        if (engArea) engArea.style.display = tab === 'before' ? 'block' : 'none';
+        if (bottomButtons) bottomButtons.style.display = tab === 'before' ? 'flex' : 'none';
+    }
+
+    function showTab(tab) {
+        if ((state.engineStartPanelActive || state.postFlightShutdownActive) && tab !== 'before') {
+            showWarning('The ENG panel sequence is locked. The CHECKLIST tab must remain open.');
+            tab = 'before';
+        }
+        state.currentTab = tab;
+        getDocuments().forEach(doc => applyTabToDocument(doc, tab));
+    }
+
+    // ============================================================
+    // ENG START PANEL
+    // ============================================================
+
+    function toggleEngPanel() {
+        if (state.engineStartPanelActive) {
+            showWarning('The ENG panel stays open and locked until both engines reach NORM.');
+            return;
+        }
+        if (state.postFlightShutdownActive) {
+            showWarning('The ENG panel stays open until both engines have been shut down.');
+            return;
+        }
+        if (state.postFlightShutdownComplete || state.engineStartPanelComplete) {
+            showWarning('The ENG panel is locked until the next Cold & Dark reset or post-flight sequence.');
+            return;
+        }
+        // During normal startup, reaching image 28 opens the panel automatically.
+        if (!state.engPanelOpen && state.image !== 28) {
+            showWarning('The ENG START panel unlocks at overhead image 28 and automatically during post-flight shutdown at image 40.');
+            return;
+        }
+
+        state.engPanelOpen = !state.engPanelOpen;
+        setEngPanelVisibility(state.engPanelOpen);
+        if (state.engPanelOpen) loadEngImage(state.engImage);
+    }
+
+    // ============================================================
+    // POPUP WINDOW
+    // ============================================================
+
+    function openOverheadWindow() {
+        playClick();
+
+        if (overheadWindow && !overheadWindow.closed) {
+            const existingPopup = overheadWindow;
+            existingPopup.focus();
+            // Allow the popup layout to settle before recalculating the cropped image.
+            existingPopup.setTimeout(() => {
+                if (overheadWindow !== existingPopup || existingPopup.closed) return;
+                loadImage(state.image);
+                if (state.engPanelOpen) loadEngImage(state.engImage);
+                updateEXTUI();
+                updateSoundUI();
+            }, 50);
+            return;
+        }
+
+        let popup;
+        try {
+            popup = window.open('', 'A350_OVERHEAD', 'popup=yes,width=1400,height=900,resizable=yes,scrollbars=no');
+        } catch (error) {
+            console.error('[A350 v3.1.0] Could not open overhead window:', error);
+            showWarning('Could not open the overhead window.');
+            return;
+        }
+
+        if (!popup) {
+            showWarning('Popup blocked. Allow popups for GeoFS.');
+            return;
+        }
+
+        overheadWindow = popup;
+
+        try {
+            popup.document.open();
+            popup.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>A350 OVERHEAD</title></head><body></body></html>');
+            popup.document.close();
+            popup.document.documentElement.classList.add('a350-popup-html');
+            popup.document.body.classList.add('a350-popup-body');
+
+            const popupStyle = popup.document.createElement('style');
+            popupStyle.textContent = style.textContent;
+            popup.document.head.appendChild(popupStyle);
+
+            const original = document.getElementById('a350-startup-window');
+            if (!original) {
+                popup.close();
+                overheadWindow = null;
+                showWarning('A350 panel could not be copied.');
+                return;
+            }
+
+            const clone = original.cloneNode(true);
+            clone.id = 'a350-overhead-window';
+            // A cloned image can inherit a fully-loaded src but not a useful onload
+            // sizing callback in the popup. Clear both src attributes before first load.
+            const clonedPanelImage = clone.querySelector('#a350-panel-image');
+            const clonedEngImage = clone.querySelector('#a350-eng-image');
+            if (clonedPanelImage) clonedPanelImage.removeAttribute('src');
+            if (clonedEngImage) clonedEngImage.removeAttribute('src');
+            popup.document.body.appendChild(clone);
+
+            bindPanelEvents(popup.document, popup);
+            renderChecklist(popup.document);
+            applyTabToDocument(popup.document, state.currentTab);
+            updateEXTUI();
+            updateSoundUI();
+            setEngPanelVisibility(state.engPanelOpen,
+                state.engineStartPanelActive || state.postFlightShutdownActive ? 'LOCKED OPEN' :
+                (state.engineStartPanelComplete || state.postFlightShutdownComplete ? 'LOCKED' : null),
+                state.engineStartPanelActive || state.engineStartPanelComplete || state.postFlightShutdownActive || state.postFlightShutdownComplete);
+
+            popup.addEventListener('resize', () => {
+                popup.setTimeout(() => {
+                    if (overheadWindow !== popup || popup.closed) return;
+                    loadImage(state.image);
+                    if (state.engPanelOpen) loadEngImage(state.engImage);
+                }, 50);
+            });
+
+            popup.addEventListener('beforeunload', () => {
+                if (overheadWindow === popup) overheadWindow = null;
+            });
+
+            popup.focus();
+            popup.setTimeout(() => {
+                if (overheadWindow !== popup || popup.closed) return;
+                loadImage(state.image);
+                if (state.engPanelOpen) loadEngImage(state.engImage);
+                syncImageNumber();
+                updateEXTUI();
+                updateSoundUI();
+            }, 50);
+        } catch (error) {
+            console.error('[A350 v3.1.0] Failed to create overhead window:', error);
+            try { popup.close(); } catch (_) {}
+            overheadWindow = null;
+            showWarning('Failed to create the overhead window.');
+        }
+    }
+
+    // ============================================================
+    // EVENT BINDING
+    // ============================================================
+
+    function bindPanelEvents(doc, popup = null) {
+        const back = doc.getElementById('a350-back');
+        if (back) back.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            handlePreviousImage();
+        });
+
+        const close = doc.getElementById('a350-close');
+        if (close) close.addEventListener('click', event => {
+            event.preventDefault(); event.stopPropagation(); playClick();
+            if (popup) { popup.close(); if (overheadWindow === popup) overheadWindow = null; }
+            else closePanel();
+        });
+
+        doc.querySelectorAll('.a350-tab').forEach(button => button.addEventListener('click', event => {
+            event.preventDefault(); playClick(); showTab(button.dataset.tab);
+        }));
+
+        const connect = doc.getElementById('a350-ext-connect');
+        if (connect) connect.addEventListener('click', () => { playClick(); connectEXT(); });
+        const disconnect = doc.getElementById('a350-ext-disconnect');
+        if (disconnect) disconnect.addEventListener('click', () => { playClick(); disconnectEXT(); });
+
+        const soundToggle = doc.getElementById('a350-sound-toggle');
+        if (soundToggle) soundToggle.addEventListener('change', () => {
+            state.soundEnabled = soundToggle.checked;
+            if (!state.soundEnabled) stopAllAudio();
+            else audio.fanRunning.volume = FAN_NORMAL_VOLUME;
+            updateSoundUI();
+        });
+
+        const coldDark = doc.getElementById('a350-cold-dark-reset');
+        if (coldDark) coldDark.addEventListener('click', () => { playClick(); applyColdAndDark(); });
+        const engToggle = doc.getElementById('a350-eng-toggle');
+        if (engToggle) engToggle.addEventListener('click', () => { playClick(); toggleEngPanel(); });
+        const engReset = doc.getElementById('a350-eng-reset');
+        if (engReset) engReset.addEventListener('click', () => { playClick(); resetChecklist(); });
+        const engFrame = doc.getElementById('a350-eng-image-frame');
+        if (engFrame) engFrame.addEventListener('click', handleEngPanelClick);
+
+        const panel = doc.getElementById('a350-panel-area');
+        if (panel) panel.addEventListener('click', event => {
+            if (event.target.closest('#a350-panel-topbar')) return;
+            handlePanelClick();
+        });
+
+        doc.addEventListener('keydown', event => {
+            if (event.key !== 'Escape') return;
+            if (popup) { popup.close(); if (overheadWindow === popup) overheadWindow = null; }
+            else if (state.open) closePanel();
+        });
+    }
+
+    // ============================================================
+    // PANEL CREATION
+    // ============================================================
+
+    function createPanel() {
+        if (document.getElementById('a350-startup-overlay')) return;
+        const overlay = document.createElement('div');
+        overlay.id = 'a350-startup-overlay';
+        const windowElement = document.createElement('div');
+        windowElement.id = 'a350-startup-window';
+        const left = document.createElement('div');
+        left.id = 'a350-left';
+        left.innerHTML = `
+            <div id="a350-left-header">
+                <div id="a350-title">A350 STARTUP</div>
+                <div id="a350-version">v3.1.0</div>
+                <button id="a350-overhead-button" type="button">OPEN A350 OVERHEAD</button>
+            </div>
+            <div id="a350-tabs">
+                <button class="a350-tab active" data-tab="before">CHECKLIST</button>
+                <button class="a350-tab" data-tab="ground">GROUND</button>
+                <button class="a350-tab" data-tab="settings">SETTINGS</button>
+            </div>
+            <div id="a350-checklist-content"></div>
+            <div id="a350-eng-area"><div id="a350-eng-image-frame"><img id="a350-eng-image" draggable="false"></div></div>
+            <div id="a350-bottom-buttons">
+                <button class="a350-bottom-button" id="a350-eng-toggle">OPEN</button>
+                <button class="a350-bottom-button" id="a350-eng-reset">RESET</button>
+            </div>
+            <div id="a350-ground-controls">
+                <div class="a350-section-title">GROUND</div>
+                <div id="a350-ext-status">EXT PWR — DISCONNECTED</div>
+                <button id="a350-ext-connect" class="a350-ground-button">CONNECT EXT PWR</button>
+                <button id="a350-ext-disconnect" class="a350-ground-button" disabled>DISCONNECT EXT PWR</button>
+            </div>
+            <div id="a350-settings">
+                <div class="a350-section-title">SETTINGS</div>
+                <div class="a350-setting"><label><input id="a350-sound-toggle" type="checkbox" checked> Sound effects</label></div>
+                <div class="a350-setting"><button id="a350-cold-dark-reset" class="a350-ground-button">APPLY COLD & DARK</button></div>
+            </div>`;
+
+        const panelArea = document.createElement('div');
+        panelArea.id = 'a350-panel-area';
+        const wrapper = document.createElement('div');
+        wrapper.id = 'a350-panel-image-wrapper';
+        const image = document.createElement('img');
+        image.id = 'a350-panel-image';
+        image.draggable = false;
+        wrapper.appendChild(image);
+        panelArea.appendChild(wrapper);
+        const topbar = document.createElement('div');
+        topbar.id = 'a350-panel-topbar';
+        const topbarLeft = document.createElement('div');
+        topbarLeft.id = 'a350-panel-topbar-left';
+        const back = document.createElement('button');
+        back.id = 'a350-back';
+        back.type = 'button';
+        back.title = 'Previous image';
+        back.setAttribute('aria-label', 'Previous image');
+        back.textContent = '←';
+        const number = document.createElement('div');
+        number.id = 'a350-image-number';
+        number.textContent = 'PANEL 1';
+        topbarLeft.append(back, number);
+        const close = document.createElement('button');
+        close.id = 'a350-close';
+        close.type = 'button';
+        close.textContent = '×';
+        topbar.append(topbarLeft, close);
+        panelArea.appendChild(topbar);
+        const warning = document.createElement('div');
+        warning.id = 'a350-warning';
+        panelArea.appendChild(warning);
+        windowElement.append(left, panelArea);
+        overlay.appendChild(windowElement);
+        document.body.appendChild(overlay);
+
+        const modal = document.createElement('div');
+        modal.id = 'a350-startup-modal';
+        modal.innerHTML = `
+            <div id="a350-startup-modal-card">
+                <h2>How do you want to start the aircraft?</h2>
+                <label>Start method<select id="a350-start-choice"><option value="apu">With APU</option><option value="ext">With EXT</option></select></label>
+                <p>Choose the aircraft startup method.</p>
+                <button id="a350-start-confirm">CONTINUE</button>
+            </div>`;
+        overlay.appendChild(modal);
+
+        left.querySelector('#a350-overhead-button').addEventListener('click', openOverheadWindow);
+        bindPanelEvents(document);
+        renderChecklist(document);
+        updateEXTUI();
+        loadImage(1);
+        loadEngImage(89);
+
+        modal.querySelector('#a350-start-confirm').addEventListener('click', () => {
+            playClick();
+            clearAPUTimer();
+            clearEXTAPUStartTimer();
+            clearPostFlightAPUTimer();
+            clearEngineTimers();
+            state.startChoice = modal.querySelector('#a350-start-choice').value;
+            state.panelPosition = 'center';
+            state.firstOpen = false;
+            state.checklistLocked = false;
+            state.lockedChecklistKey = null;
+            state.extInitiallyConnected = false;
+            state.extConnectedDuringSequence = false;
+            state.extSoundsStarted = false;
+            state.fanSequenceRequested = false;
+            state.postFlightShutdownActive = false;
+            state.postFlightShutdownComplete = false;
+            state.apuStarted = false;
+            state.apuAvailable = false;
+            state.apuGenSoundsPlayed = false;
+            state.eng1Started = false;
+            state.eng2Started = false;
+            state.eng1Starting = false;
+            state.eng2Starting = false;
+            state.eng1Stopping = false;
+            state.eng2Stopping = false;
+            state.engMode = 'NORM';
+            state.engNormReached = false;
+            state.engineStartPanelActive = false;
+            state.engineStartPanelComplete = false;
+            state.engImage = 89;
+            state.engPanelOpen = false;
+            state.sequenceIndex = 0;
+            getDocuments().forEach(doc => {
+                const frame = doc.getElementById('a350-eng-image-frame');
+                const button = doc.getElementById('a350-eng-toggle');
+                if (frame) frame.style.display = 'none';
+                if (button) { button.textContent = 'OPEN'; button.disabled = false; }
+            });
+            loadEngImage(89);
+            positionPanel();
+            modal.style.display = 'none';
+            refreshChecklist();
+            loadImage(1);
+            resetSequenceCursor();
+        });
+    }
+
+    // ============================================================
+    // PANEL POSITION AND OPEN/CLOSE
+    // ============================================================
+
+    function positionPanel() {
+        const panel = document.getElementById('a350-startup-window');
+        if (!panel) return;
+        state.panelPosition = 'center';
+        panel.style.left = '50%';
+        panel.style.right = 'auto';
+        panel.style.transform = 'translate(-50%, -50%)';
+    }
+
+    function openPanel() {
+        createPanel();
+        const overlay = document.getElementById('a350-startup-overlay');
+        if (!overlay) return;
+        overlay.style.display = 'block';
+        state.open = true;
+        if (state.firstOpen || !state.startChoice) {
+            const modal = document.getElementById('a350-startup-modal');
+            if (modal) modal.style.display = 'flex';
+        } else positionPanel();
+        loadImage(state.image);
+        updateEXTUI();
+        updateSoundUI();
+        console.log('[A350 v3.1.0] Panel opened.');
+    }
+
+    function closePanel() {
+        const overlay = document.getElementById('a350-startup-overlay');
+        if (overlay) overlay.style.display = 'none';
+        state.open = false;
+        console.log('[A350 v3.1.0] Panel closed.');
+    }
+
+    function togglePanel() { if (state.open) closePanel(); else openPanel(); }
+
+    // ============================================================
+    // GEOFS MENU BUTTON
+    // ============================================================
+
+    function isElementVisible(element) {
+        if (!element) return false;
+        return !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+    }
+
+    function isGeoFSReplayActive() {
+        const replayButtons = Array.from(document.querySelectorAll('.geofs-f-recordPlayer button'));
+        return replayButtons.some(button => {
+            if (!isElementVisible(button)) return false;
+            const icon = button.querySelector('i');
+            const iconText = icon ? icon.textContent.trim() : '';
+            return iconText === 'pause' || iconText === 'play_arrow';
+        });
+    }
+
+    function updateMenuButtonVisibility() {
+        const button = document.getElementById('a350-startup-menu-button');
+        if (button) button.classList.toggle('a350-hidden-in-replay', isGeoFSReplayActive());
+    }
+
+    function createMenuButton() {
+        const existing = document.getElementById('a350-startup-menu-button');
+        if (existing) { updateMenuButtonVisibility(); return true; }
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const findButton = text => buttons.find(button => (button.textContent || '').trim().toLowerCase() === text);
+        const aircraftButton = findButton('aircraft');
+        const locationButton = findButton('location');
+        const cameraButton = findButton('camera');
+        const reference = cameraButton || locationButton || aircraftButton;
+        if (!reference) return false;
+        const button = document.createElement('button');
+        button.id = 'a350-startup-menu-button';
+        button.type = 'button';
+        button.className = 'mdl-button mdl-js-button';
+        button.textContent = 'STARTUP';
+        button.addEventListener('click', event => {
+            event.preventDefault(); event.stopPropagation(); playClick(); togglePanel();
+        });
+        reference.insertAdjacentElement('afterend', button);
+        if (window.componentHandler && window.componentHandler.upgradeElement) {
+            try { window.componentHandler.upgradeElement(button); } catch (_) {}
+        }
+        updateMenuButtonVisibility();
+        return true;
+    }
+
+    // ============================================================
+    // INITIALIZATION / PUBLIC API
+    // ============================================================
+
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && state.open) closePanel();
+    });
+
+    window.addEventListener('resize', () => {
+        if (state.open) loadImage(state.image);
+        if (state.engPanelOpen) loadEngImage(state.engImage);
+    });
+
+    window.a350 = {
+        state,
+        open: openPanel,
+        close: closePanel,
+        toggle: togglePanel,
+        image: loadImage,
+        previous: handlePreviousImage,
+        next: () => {
+            if (state.image === 28 && !state.engNormReached) {
+                showWarning('Complete the ENG start sequence and reach image 93 (NORM) first.');
+                return;
+            }
+            if (state.image === 38 && state.postFlightAPUTimer !== null) return;
+            if (state.postFlightShutdownActive && [40, 41, 42].includes(state.image)) {
+                showWarning('Overhead navigation is locked. Use the ENG panel to shut down both engines.');
+                return;
+            }
+            const next = getNextImage();
+            if (next !== null) loadImage(next);
+        },
+        connectEXT,
+        disconnectEXT,
+        coldDark: applyColdAndDark,
+        resetChecklist,
+        startEngine1,
+        startEngine2
+    };
+
+    createPanel();
+    let menuAttempts = 0;
+    const menuTimer = setInterval(() => {
+        menuAttempts++;
+        if (createMenuButton() || menuAttempts >= 120) clearInterval(menuTimer);
+    }, 500);
+    setInterval(updateMenuButtonVisibility, 400);
+    console.log('[A350 v3.1.0] GeoFS A350 Startup v3.1.0 ready.');
+})();
